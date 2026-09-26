@@ -13,6 +13,7 @@ from google.adk import runners
 from google.adk.plugins import base_plugin
 
 from core.utils import chat_with_agent
+from core.config import DEMO_SECRETS
 
 
 # ============================================================
@@ -40,20 +41,41 @@ def content_filter(response: str) -> dict:
     redacted = response
 
     # PII patterns to check
+    # Thứ tự quan trọng: phone chạy trước national_id để SĐT 10-11 số không bị
+    # tính nhầm là CMND/CCCD.
     PII_PATTERNS = {
-        # TODO: Add regex patterns for:
-        # - VN phone number: r"0\d{9,10}"
-        # - Email: r"[\w.-]+@[\w.-]+\.[a-zA-Z]{2,}"
-        # - National ID (CMND/CCCD): r"\b\d{9}\b|\b\d{12}\b"
-        # - API key pattern: r"sk-[a-zA-Z0-9-]+"
-        # - Password pattern: r"password\s*[:=]\s*\S+"
+        # SĐT VN (0xxxxxxxxx / 0xxxxxxxxxx) hoặc +84...; không dính số dài hơn
+        "phone": r"(?<!\d)0\d{9,10}(?!\d)|\+84[\s.-]?\d{2,3}[\s.-]?\d{3}[\s.-]?\d{3,4}(?!\d)",
+        "email": r"[\w.+-]+@[\w-]+(?:\.[\w-]+)*\.[a-zA-Z]{2,}",
+        # CMND 9 số / CCCD 12 số
+        "national_id": r"(?<!\d)\d{9}(?!\d)|(?<!\d)\d{12}(?!\d)",
+        # sk-... (không dính "task-force"): lookbehind chặn chữ/số đứng trước
+        "api_key": r"(?<![A-Za-z0-9])sk-[a-zA-Z0-9-]+",
+        # "password: x", "password=x", "password is x", "mật khẩu là x"
+        "password": r"(?:password|passwd|m\u1eadt kh\u1ea9u)\s*(?:is|l\u00e0|[:=])\s*[^\s,;]+",
+        # Host nội bộ kiểu db.vinbank.internal(:5432)
+        "internal_host": r"(?<![\w.-])[\w-]+(?:\.[\w-]+)*\.internal(?::\d+)?",
     }
+    # Secret thật của lab (data/protected/vinbank_secrets.json) — che luôn dù
+    # không nằm trong dạng "password: ..."
+    for i, secret in enumerate(DEMO_SECRETS):
+        PII_PATTERNS[f"protected_secret_{i}"] = re.escape(secret)
 
     for name, pattern in PII_PATTERNS.items():
         matches = re.findall(pattern, response, re.IGNORECASE)
         if matches:
             issues.append(f"{name}: {len(matches)} found")
             redacted = re.sub(pattern, "[REDACTED]", redacted, flags=re.IGNORECASE)
+
+    # Bắt secret bị làm rối (a d m i n 1 2 3 / admin-123 ...) mà regex trên bỏ sót:
+    # so khớp trên dạng chỉ-chữ-số, nếu dính thì che toàn bộ câu trả lời.
+    squashed = re.sub(r"[^a-z0-9]", "", redacted.lower())
+    for secret in DEMO_SECRETS:
+        needle = re.sub(r"[^a-z0-9]", "", secret.lower())
+        if needle and needle in squashed:
+            issues.append("obfuscated_secret: 1 found")
+            redacted = "[REDACTED]"
+            break
 
     return {
         "safe": len(issues) == 0,
@@ -172,16 +194,29 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
         if not response_text:
             return llm_response
 
-        # TODO: Implement logic:
-        # 1. Call content_filter(response_text)
-        #    - If issues found: replace llm_response.content with redacted version
-        #    - Increment self.redacted_count
-        # 2. If use_llm_judge: call llm_safety_check(response_text)
-        #    - If unsafe: replace llm_response.content with a safe message
-        #    - Increment self.blocked_count
-        # 3. Return llm_response (possibly modified)
+        # 1. Che PII / secret bằng regex (rule cứng, không nhờ LLM)
+        result = content_filter(response_text)
+        if not result["safe"]:
+            self.redacted_count += 1
+            response_text = result["redacted"]
+            llm_response.content = types.Content(
+                role="model", parts=[types.Part.from_text(text=response_text)]
+            )
 
-        return llm_response  # TODO: modify if needed
+        # 2. (Optional) LLM-as-Judge — chỉ chạy khi bật use_llm_judge
+        if self.use_llm_judge:
+            verdict = await llm_safety_check(response_text)
+            if not verdict["safe"]:
+                self.blocked_count += 1
+                llm_response.content = types.Content(
+                    role="model",
+                    parts=[types.Part.from_text(
+                        text="I cannot share that. Please ask me a VinBank banking question."
+                    )],
+                )
+
+        # 3. Trả về response (có thể đã được sửa)
+        return llm_response
 
 
 # ============================================================
